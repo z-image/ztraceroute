@@ -1,0 +1,125 @@
+#!/usr/bin/perl -w
+# Author: Theodor Milkov <zimage@del.bg>
+# Credits:
+#  Various hacks by Marco d'Itri <md@linux.it>
+#  Aggregated AS blocks parsing based on ideas from 
+#   John Fraizer <zebra@enterzone.net> and Jeff Barrow <jeffb@netc.com>
+
+require 5;
+use Socket;
+use strict;
+
+my $traceroute = "/usr/bin/traceroute -n";
+my $router     = "localhost";
+my $port       = 2605;
+my $pass       = "vtypass";
+
+# You shouldn't care about anything below this line.
+
+sub getasnum($) {
+	my $address = $_[0];
+	my $proto   = getprotobyname('tcp');
+	socket( SH, AF_INET, SOCK_STREAM, $proto ) or die ("No socket: $!");
+	my $router_addr = inet_aton($router)
+	  or die ("Check your router address ($router): $!");
+	my $sin = sockaddr_in( $port, $router_addr );
+	connect( SH, $sin ) or die ("Connect failed: $!");
+
+	{ my $oldfh = select SH; $| = 1; select $oldfh; }
+
+	my $word  = '';
+	my $c     = '';
+	my $state = 0;
+
+	while ( read( SH, $c, 1 ) ) {
+		$word .= $c;
+
+		if ( $c eq "\n" ) {
+			if ( $state == 3 ) {
+				$_ = $word;
+				chomp();
+				$word =~ s/[\r\n]//g;
+
+				my ($asnum) = $word =~ /^[\d\s]*\s(\d+)$/;
+				return $asnum if $asnum;
+
+				($asnum) = $word =~ /aggregated by (\d+) /;
+				return $asnum if $asnum;
+			}
+			elsif ( $state == 2 ) {
+				$state = 3;
+			}
+			$word = '';
+			next;
+		}
+
+		if ( $word =~ /Password:/i ) {
+			print SH "$pass\n";
+			$word = '';
+			next;
+		}
+
+		if ( $word =~ /[a-zA-Z0-9-]+\>/ ) {
+			if ( $state == 0 ) {
+				print SH "term len 0\n";
+				$state = 1;
+			}
+			elsif ( $state == 1 ) {
+				my $v6 = ( $address =~ /:/ ) ? 'v6' : '';
+				print SH "show ip$v6 bgp $address\n";
+				$state = 2;
+			}
+			elsif ( $state == 3 ) {
+				print SH "exit\n";
+				last;
+			}
+			$word = '';
+			next;
+		}
+	}
+	if ( $state < 1 ) {
+		return -1;
+	}
+	close(SH);
+	return 0;
+}
+
+my $address = $ARGV[0] or die ("Missing argument");
+open( TPIPE, "$traceroute $address|" )
+  or die ("Cannot fork for traceroute: [$!]");
+
+$| = 1;
+
+while (<TPIPE>) {
+	chomp;
+
+	# 1  193.254.29.17  0.772 ms  0.655 ms  0.639 ms
+	# 20  * * *
+	# 4  212.5.140.57  1830.348 ms * *
+
+	my ( $hop, $ip, $extra ) = /^\s*(\d+)\s+([\d\.]+)?\s+(.+)/;
+	my ( $name, $asnum );
+	if ($ip) {
+		$name = gethostbyaddr( inet_aton($ip), AF_INET );
+		$name = $ip unless $name;
+
+		$asnum = getasnum($ip);
+		if ( $asnum && $asnum > 0 && $asnum < 65535 ) {
+			$asnum = "[$asnum]";
+		}
+		elsif ( $asnum == -1 ) {
+			die ("getasnum() never reached state > 0. Check your settings.");
+		}
+		else {
+			$asnum = '';
+		}
+	}
+	else {
+		$ip = $name = $asnum = '';
+	}
+
+	printf( "%2i %s (%s) %s %s\n", $hop, $name, $ip, $asnum, $extra );
+}
+
+close TPIPE or die ('Close failed');
+exit 0;
